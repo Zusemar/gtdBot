@@ -1,560 +1,538 @@
 package main
 
-// Bot implementing a simple GTD-style assistant with topics (tasks, reminders,
-// shopping basket) and a minimal scheduler.  This code is designed as a
-// starting point for your Telegram bot.  It persists items into a SQLite
-// database, maintains an in‑memory state per chat to know which topic is
-// currently active, and periodically sends reminders and performs a daily
-// cleanup.  The reminder times and the TTL for resetting the state are
-// configurable via constants at the top of the file.  Google Calendar
-// integration is stubbed out; replace the placeholder with calls to the
-// Google Calendar API if desired.
-
 import (
+	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/joho/godotenv"
 	_ "modernc.org/sqlite"
 )
 
-// Configuration constants.  Adjust these values to suit your workflow.
-
-// Bot token.  Set this environment variable before running the bot.  For
-// example: export BOT_TOKEN=123456:ABCDEF... .  The program will exit if
-// BOT_TOKEN is not provided.
-const envBotToken = "BOT_TOKEN"
-
-// Path to the SQLite database file.  By default the bot uses a file named
-// gtd.db in the current working directory.  You can override this via the
-// DB_PATH environment variable.
-const envDBPath = "DB_PATH"
-
-// Time zone used for scheduling reminders and daily cleanup.  The default
-// value corresponds to Moscow time.  Override via TZ env var if you live in
-// another time zone.
-const envTimeZone = "TZ"
-
-// ReminderTimes defines the local times at which reminders should be sent.
-// Times are specified in 24‑hour "HH:MM" format.  You can adjust these
-// strings to change the notification schedule.  The times here reflect the
-// user's request to send reminders at 08:00, 10:00, 14:00, 19:00 and 23:00.
-var ReminderTimes = []string{
-	"08:00",
-	"10:00",
-	"14:00",
-	"19:00",
-	"23:00",
-}
-
-// TTLMinutes defines how long (in minutes) a selected topic remains active
-// after the last user interaction.  When the TTL expires the bot defaults
-// back to the basket topic.  The user asked for a TTL of 10 minutes.
-const TTLMinutes = 10
-
-// DailyCleanupHour defines the hour at which reminders should be wiped.  At
-// this time the bot will delete all existing reminder items.  The minute is
-// fixed at zero.  Adjust the hour if you prefer another cleanup time.  The
-// user wanted reminders older than one day to be removed at night; we choose
-// 03:00 local time for the cleanup.
-const DailyCleanupHour = 3
-
-// Topics represent the different lists supported by the bot.  Basket is the
-// default topic; when no topic is selected all incoming messages go to the
-// basket.  The textual representation is stored in the database.  Use
-// lowercase strings for consistency.
 const (
-	TopicBasket    = "basket"
 	TopicTasks     = "tasks"
 	TopicReminders = "reminders"
 	TopicShopping  = "shopping"
+	TopicBasket    = "basket"
+
+	StatusActive = "active"
 )
 
-// State holds per‑chat metadata such as the current topic and the time of
-// last activity.  It lives in memory only.  If the bot is restarted or
-// crashes, the state will be reset to the default topic.
-type State struct {
+type ChatState struct {
 	Topic        string
 	LastActivity time.Time
 }
 
-// Item represents a single entry in the database.  Only the fields used by
-// the bot at runtime are defined here.  Additional fields can be added as
-// needed (for example, to track last sent timestamps for reminders).
+type Store struct {
+	DB *sql.DB
+}
+
 type Item struct {
 	ID        int64
 	ChatID    int64
 	Topic     string
 	Text      string
 	CreatedAt time.Time
-	Status    int // 0=active, 1=deleted
 }
 
-// states maps chat IDs to State instances.  Access to this map is not
-// synchronized because the bot runs a single goroutine processing updates
-// sequentially.  If you refactor to use multiple goroutines, guard this map
-// with a mutex.
-var states = make(map[int64]*State)
-
-// lastRemindersSent tracks the date on which reminders were last sent for
-// each schedule time.  The key is "HH:MM" and the value is a date string
-// "YYYY‑MM‑DD".  This prevents sending reminders multiple times in the
-// same day when checking every minute.  It's accessed from the scheduler
-// goroutine only and does not need synchronization.
-var lastRemindersSent = make(map[string]string)
-
-func main() {
-	// Read configuration from the environment.
-	botToken := os.Getenv(envBotToken)
-	if botToken == "" {
-		log.Fatalf("%s is not set; please provide your Telegram bot token", envBotToken)
+func mustEnv(key string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		log.Fatalf("missing required env %s", key)
 	}
-	dbPath := os.Getenv(envDBPath)
-	if dbPath == "" {
-		dbPath = "gtd.db"
-	}
-	tz := os.Getenv(envTimeZone)
-	if tz == "" {
-		// Default to Moscow time as requested by the user.
-		tz = "Europe/Moscow"
-	}
+	return v
+}
 
-	// Parse the location for scheduling.  If the time zone identifier is
-	// invalid the program will abort.
-	loc, err := time.LoadLocation(tz)
-	if err != nil {
-		log.Fatalf("invalid time zone %q: %v", tz, err)
+func envOr(key, def string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
 	}
+	return v
+}
 
-	// Connect to SQLite database and perform a migration to create the items
-	// table.  Using modernc.org/sqlite eliminates the need for CGO.
+func openStore(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		log.Fatalf("failed to open database: %v", err)
+		return nil, err
 	}
-	if err := migrate(db); err != nil {
-		log.Fatalf("failed to run migration: %v", err)
-	}
+	db.SetMaxOpenConns(1)
 
-	// Start the Telegram bot API.
-	bot, err := tgbotapi.NewBotAPI(botToken)
+	s := &Store{DB: db}
+	if err := s.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) migrate() error {
+	ddl := `
+CREATE TABLE IF NOT EXISTS items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  topic TEXT NOT NULL,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_items_chat_topic_status ON items(chat_id, topic, status);
+
+CREATE TABLE IF NOT EXISTS kv (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+`
+	_, err := s.DB.Exec(ddl)
+	return err
+}
+
+func (s *Store) SetKV(key, value string) error {
+	_, err := s.DB.Exec(`INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, key, value)
+	return err
+}
+
+func (s *Store) GetKV(key string) (string, bool) {
+	var v string
+	err := s.DB.QueryRow(`SELECT v FROM kv WHERE k=?`, key).Scan(&v)
 	if err != nil {
-		log.Fatalf("failed to create Telegram bot: %v", err)
+		return "", false
 	}
-	// Optionally enable verbose logging of all requests and responses.
-	bot.Debug = false
-	log.Printf("Authorized on account %s", bot.Self.UserName)
-
-	// Launch scheduler goroutine for sending reminders and performing cleanup.
-	go scheduler(bot, db, loc)
-
-	// Configure update polling.  We use long polling with a 60 second timeout.
-	updateConfig := tgbotapi.NewUpdate(0)
-	updateConfig.Timeout = 60
-	updates := bot.GetUpdatesChan(updateConfig)
-
-	// Main event loop: handle incoming messages and callback queries.
-	for update := range updates {
-		if update.CallbackQuery != nil {
-			handleCallback(bot, db, update.CallbackQuery)
-			continue
-		}
-		if update.Message != nil {
-			handleMessage(bot, db, update.Message, loc)
-			continue
-		}
-	}
+	return v, true
 }
 
-// migrate creates the items table if it does not already exist.  The table
-// stores items for all chats.  Each item belongs to a topic and may be
-// marked as deleted when it has been handled.  Additional columns can be
-// added without breaking existing bots as long as they allow NULLs or have
-// default values.
-func migrate(db *sql.DB) error {
-	const createTable = `
-    CREATE TABLE IF NOT EXISTS items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER NOT NULL,
-        topic TEXT NOT NULL,
-        text TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        status INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_items_chat_topic_status ON items(chat_id, topic, status);
-    `
-	_, err := db.Exec(createTable)
-	return err
-}
-
-// getState returns the State associated with chatID.  If no state exists a
-// new one is created with the default topic.  The state's LastActivity is
-// updated to the current time whenever it is returned.
-func getState(chatID int64) *State {
-	s, ok := states[chatID]
-	if !ok {
-		s = &State{Topic: TopicBasket}
-		states[chatID] = s
-	}
-	return s
-}
-
-// resetTopicIfExpired resets the chat's topic to the basket if the last
-// activity occurred more than TTLMinutes ago.  After resetting, the
-// LastActivity timestamp is updated to now.
-func resetTopicIfExpired(s *State, now time.Time) {
-	if now.Sub(s.LastActivity) > time.Duration(TTLMinutes)*time.Minute {
-		s.Topic = TopicBasket
-	}
-	s.LastActivity = now
-}
-
-// handleMessage processes an incoming message.  It recognises commands,
-// text from the reply keyboard buttons and arbitrary text.  Commands are
-// prefixed with '/'; buttons are plain text matching the button labels.
-func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, msg *tgbotapi.Message, loc *time.Location) {
-	chatID := msg.Chat.ID
-	now := time.Now().In(loc)
-	s := getState(chatID)
-	// Reset topic on inactivity.
-	resetTopicIfExpired(s, now)
-
-	// Slash commands override other processing.
-	if msg.IsCommand() {
-		switch msg.Command() {
-		case "start":
-			handleStart(bot, msg)
-		case "menu":
-			handleMenu(bot, msg)
-		default:
-			// Unknown commands are ignored gracefully.
-		}
-		return
-	}
-
-	// Reply keyboard button presses are treated as plain text.  Check for
-	// known labels and switch topics accordingly.  The menu button resets
-	// to the basket topic.
-	switch strings.ToLower(msg.Text) {
-	case "tasks":
-		s.Topic = TopicTasks
-		s.LastActivity = now
-		reply := tgbotapi.NewMessage(chatID, "Текущий раздел: задачи")
-		reply.ReplyMarkup = defaultKeyboard()
-		bot.Send(reply)
-		return
-	case "reminders", "напоминания":
-		s.Topic = TopicReminders
-		s.LastActivity = now
-		reply := tgbotapi.NewMessage(chatID, "Текущий раздел: напоминания")
-		reply.ReplyMarkup = defaultKeyboard()
-		bot.Send(reply)
-		return
-	case "shopping", "покупки":
-		s.Topic = TopicShopping
-		s.LastActivity = now
-		reply := tgbotapi.NewMessage(chatID, "Текущий раздел: покупки")
-		reply.ReplyMarkup = defaultKeyboard()
-		bot.Send(reply)
-		return
-	case "basket", "корзина":
-		s.Topic = TopicBasket
-		s.LastActivity = now
-		reply := tgbotapi.NewMessage(chatID, "Текущий раздел: корзина")
-		reply.ReplyMarkup = defaultKeyboard()
-		bot.Send(reply)
-		return
-	case "menu", "меню":
-		s.Topic = TopicBasket
-		s.LastActivity = now
-		reply := tgbotapi.NewMessage(chatID, "Главное меню")
-		reply.ReplyMarkup = defaultKeyboard()
-		bot.Send(reply)
-		return
-	}
-
-	// For any other text we treat it as content to be stored in the
-	// currently selected topic.  Only non‑empty messages are stored.
-	if strings.TrimSpace(msg.Text) == "" {
-		return
-	}
-	if err := insertItem(db, chatID, s.Topic, msg.Text, now); err != nil {
-		log.Printf("failed to store item: %v", err)
-		return
-	}
-	// Send confirmation to the user indicating which list the message went to.
-	ack := fmt.Sprintf("Добавил сообщение в %s", humanTopic(s.Topic))
-	reply := tgbotapi.NewMessage(chatID, ack)
-	reply.ReplyMarkup = defaultKeyboard()
-	bot.Send(reply)
-}
-
-// handleStart sends a welcome message and resets the chat's topic to the
-// basket.  It also displays the main menu keyboard.
-func handleStart(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	chatID := msg.Chat.ID
-	s := getState(chatID)
-	s.Topic = TopicBasket
-	s.LastActivity = time.Now()
-	text := "Привет! Это GTD бот. Вы можете добавлять задачи, напоминания и покупки. " +
-		"Используйте кнопки для выбора раздела."
-	reply := tgbotapi.NewMessage(chatID, text)
-	reply.ReplyMarkup = defaultKeyboard()
-	bot.Send(reply)
-}
-
-// handleMenu resets the topic to the basket and re‑shows the main menu.
-func handleMenu(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	chatID := msg.Chat.ID
-	s := getState(chatID)
-	s.Topic = TopicBasket
-	s.LastActivity = time.Now()
-	reply := tgbotapi.NewMessage(chatID, "Главное меню")
-	reply.ReplyMarkup = defaultKeyboard()
-	bot.Send(reply)
-}
-
-// insertItem stores a new item in the database.  It records the chatID, the
-// current topic, the text of the message and the creation timestamp.  The
-// status is always set to 0 (active).
-func insertItem(db *sql.DB, chatID int64, topic, text string, at time.Time) error {
-	if topic == "" {
-		return errors.New("topic is empty")
-	}
-	_, err := db.Exec(
-		"INSERT INTO items(chat_id, topic, text, created_at, status) VALUES(?, ?, ?, ?, 0)",
-		chatID,
-		topic,
-		text,
-		at.Unix(),
+func (s *Store) AddItem(chatID int64, topic, text string) (int64, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(
+		`INSERT INTO items(chat_id, topic, text, status, created_at) VALUES(?,?,?,?,?)`,
+		chatID, topic, text, StatusActive, now,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
-// loadActiveItems loads all active items for a given chat and topic.  Deleted
-// items (status=1) are ignored.  This function returns a slice of Item
-// structs.  If no items exist, it returns an empty slice and nil error.
-func loadActiveItems(db *sql.DB, chatID int64, topic string) ([]Item, error) {
-	rows, err := db.Query(
-		"SELECT id, text, created_at FROM items WHERE chat_id = ? AND topic = ? AND status = 0 ORDER BY id",
-		chatID,
-		topic,
-	)
+func (s *Store) ListActive(chatID int64, topic string) ([]Item, error) {
+	q := `SELECT id, chat_id, topic, text, created_at FROM items WHERE chat_id=? AND status=?`
+	args := []any{chatID, StatusActive}
+	if topic != "" {
+		q += ` AND topic=?`
+		args = append(args, topic)
+	}
+	q += ` ORDER BY id ASC`
+	rows, err := s.DB.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Item
+
+	var out []Item
 	for rows.Next() {
 		var it Item
-		var ts int64
-		if err := rows.Scan(&it.ID, &it.Text, &ts); err != nil {
+		var created string
+		if err := rows.Scan(&it.ID, &it.ChatID, &it.Topic, &it.Text, &created); err != nil {
 			return nil, err
 		}
-		it.ChatID = chatID
-		it.Topic = topic
-		it.CreatedAt = time.Unix(ts, 0)
-		items = append(items, it)
+		t, _ := time.Parse(time.RFC3339, created)
+		it.CreatedAt = t
+		out = append(out, it)
 	}
-	return items, rows.Err()
+	return out, rows.Err()
 }
 
-// deleteItem marks an item as deleted.  This is used when the user taps
-// the ✅ button in a reminder message.  If no rows are affected the ID may
-// be invalid.
-func deleteItem(db *sql.DB, chatID, id int64) error {
-	_, err := db.Exec("UPDATE items SET status = 1 WHERE chat_id = ? AND id = ?", chatID, id)
+func (s *Store) DeleteItem(chatID, id int64) error {
+	_, err := s.DB.Exec(`DELETE FROM items WHERE chat_id=? AND id=?`, chatID, id)
 	return err
 }
 
-// handleCallback processes inline keyboard callback queries.  For now we
-// support only deletion of reminder items via data in the form "done:<id>".
-func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, cq *tgbotapi.CallbackQuery) {
-	// Acknowledge the callback to remove the loading animation.
-	answer := tgbotapi.NewCallback(cq.ID, "")
-	bot.Request(answer)
-
-	// Parse the callback data.  Expect format "done:<id>".
-	parts := strings.SplitN(cq.Data, ":", 2)
-	if len(parts) != 2 || parts[0] != "done" {
-		return
-	}
-	id, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return
-	}
-	chatID := cq.Message.Chat.ID
-	// Mark the item as deleted.
-	if err := deleteItem(db, chatID, id); err != nil {
-		log.Printf("failed to delete reminder item %d: %v", id, err)
-	}
-	// Optionally edit the message to reflect the deletion.  For simplicity
-	// this implementation does not modify the original message; the next
-	// reminder broadcast will omit deleted items.
+func (s *Store) DeleteAllReminders(chatID int64) error {
+	_, err := s.DB.Exec(`DELETE FROM items WHERE chat_id=? AND topic=?`, chatID, TopicReminders)
+	return err
 }
 
-// scheduler runs in a separate goroutine.  It wakes up every minute to
-// perform scheduled tasks: sending reminders at specified times and cleaning
-// up reminders nightly.  It also sends a daily Google Calendar digest at
-// morning time.  Replace the sendCalendarDigest function with a real call
-// to Google Calendar if you wish to integrate your agenda.
-func scheduler(bot *tgbotapi.BotAPI, db *sql.DB, loc *time.Location) {
-	// Determine the hour and minute components of the configured reminder times.
-	type hm struct{ hour, minute int }
-	var schedule []hm
-	for _, s := range ReminderTimes {
-		p := strings.Split(s, ":")
-		if len(p) != 2 {
-			log.Printf("invalid reminder time %q; skipping", s)
-			continue
-		}
-		h, _ := strconv.Atoi(p[0])
-		m, _ := strconv.Atoi(p[1])
-		schedule = append(schedule, hm{h, m})
-	}
-	// Morning digest time: fixed at 08:00 for now.  Adjust if needed.
-	digestHour := 8
-	digestMinute := 0
-
-	// Variables to track last cleanup and last digest.  Using date strings
-	// prevents multiple runs within the same day.
-	lastCleanupDate := ""
-	lastDigestDate := ""
-	for {
-		now := time.Now().In(loc)
-		// Reminders: check each configured time.
-		dateKey := now.Format("2006-01-02")
-		for _, t := range schedule {
-			if now.Hour() == t.hour && now.Minute() == t.minute {
-				key := fmt.Sprintf("%02d:%02d", t.hour, t.minute)
-				if lastRemindersSent[key] != dateKey {
-					// Send reminders to all chats currently known.  If you want
-					// to limit this to a single user you can instead call
-					// sendReminders for that chat only.
-					for chatID := range states {
-						sendReminders(bot, db, chatID, loc)
-					}
-					lastRemindersSent[key] = dateKey
-				}
-			}
-		}
-		// Daily cleanup at DailyCleanupHour:00.
-		if now.Hour() == DailyCleanupHour && now.Minute() == 0 {
-			if lastCleanupDate != dateKey {
-				cleanupReminders(db)
-				lastCleanupDate = dateKey
-			}
-		}
-		// Morning digest at digestHour:digestMinute.
-		if now.Hour() == digestHour && now.Minute() == digestMinute {
-			if lastDigestDate != dateKey {
-				for chatID := range states {
-					sendCalendarDigest(bot, chatID, loc)
-				}
-				lastDigestDate = dateKey
-			}
-		}
-		// Sleep until the next minute.
-		time.Sleep(time.Minute)
-	}
-}
-
-// sendReminders fetches all active reminders for a chat and sends them as a
-// single message.  The message includes numbered lines and an inline
-// keyboard with a ✅ button for each reminder, allowing the user to mark it
-// as done.  If no reminders exist, nothing is sent.
-func sendReminders(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, loc *time.Location) {
-	items, err := loadActiveItems(db, chatID, TopicReminders)
-	if err != nil {
-		log.Printf("failed to load reminders: %v", err)
-		return
-	}
-	if len(items) == 0 {
-		return
-	}
-	// Build the message body.
-	var sb strings.Builder
-	sb.WriteString("Напоминания:\n")
-	buttons := make([]tgbotapi.InlineKeyboardButton, 0, len(items))
-	for i, item := range items {
-		sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, item.Text))
-		// Each button holds the item ID so the callback can delete it.
-		btnText := fmt.Sprintf("✅ %d", i+1)
-		callbackData := fmt.Sprintf("done:%d", item.ID)
-		buttons = append(buttons, tgbotapi.InlineKeyboardButton{
-			Text:         btnText,
-			CallbackData: &callbackData,
-		})
-	}
-	// Arrange buttons in a single row.  If you prefer multiple rows you can
-	// distribute the buttons into several rows of the InlineKeyboardMarkup.
-	markup := tgbotapi.NewInlineKeyboardMarkup(buttons)
-	msg := tgbotapi.NewMessage(chatID, sb.String())
-	msg.ReplyMarkup = markup
-	bot.Send(msg)
-}
-
-// cleanupReminders deletes all reminder items from the database.  It runs
-// nightly to prevent reminders from accumulating beyond a day.  Adjust the
-// SQL statement if you want to archive rather than delete.
-func cleanupReminders(db *sql.DB) {
-	_, err := db.Exec("DELETE FROM items WHERE topic = ?", TopicReminders)
-	if err != nil {
-		log.Printf("failed to delete reminders: %v", err)
-	}
-}
-
-// sendCalendarDigest sends a daily digest of the user's schedule.  Replace
-// the body of this function with an actual call to the Google Calendar API.
-// The user requested to receive their schedule in the morning.  For now we
-// send a placeholder message.  If you integrate Google Calendar, you can
-// remove the placeholder and build the digest from the events returned by
-// the API.
-func sendCalendarDigest(bot *tgbotapi.BotAPI, chatID int64, loc *time.Location) {
-	// Placeholder implementation.  To integrate Google Calendar:
-	// 1. Authorise with the Calendar API (OAuth2 or service account).
-	// 2. Query events for today using the time zone in `loc`.
-	// 3. Format the events into a message and send it here.
-	msg := tgbotapi.NewMessage(chatID, "Ваше расписание на сегодня из Google Calendar (placeholder)")
-	bot.Send(msg)
-}
-
-// defaultKeyboard returns the reply keyboard markup used for the main menu.
-// The keyboard consists of buttons for each topic and a menu button.  The
-// labels are localised in both English and Russian to illustrate how you
-// could support multiple languages; the bot simply compares lowercase text
-// when matching button presses.
-func defaultKeyboard() tgbotapi.ReplyKeyboardMarkup {
-	return tgbotapi.NewReplyKeyboard(
-		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Tasks"),
-			tgbotapi.NewKeyboardButton("Reminders"),
-			tgbotapi.NewKeyboardButton("Shopping"),
-			tgbotapi.NewKeyboardButton("Basket"),
-			tgbotapi.NewKeyboardButton("Menu"),
-		),
-	)
-}
-
-// humanTopic maps internal topic identifiers to human‑readable names.  Use
-// this when acknowledging to the user that a message was added to a list.
-func humanTopic(topic string) string {
+func topicLabel(topic string) string {
 	switch topic {
 	case TopicTasks:
-		return "задачи"
+		return "ЗАДАЧИ"
 	case TopicReminders:
-		return "напоминания"
+		return "НАПОМИНАНИЯ"
 	case TopicShopping:
-		return "покупки"
+		return "ПОКУПКИ"
 	case TopicBasket:
-		return "корзину"
+		return "КОРЗИНУ"
 	default:
-		return topic
+		return strings.ToUpper(topic)
+	}
+}
+
+func isTopicButtonText(t string) (string, bool) {
+	switch strings.TrimSpace(strings.ToLower(t)) {
+	case "задачи":
+		return TopicTasks, true
+	case "напоминания":
+		return TopicReminders, true
+	case "покупки":
+		return TopicShopping, true
+	case "корзина":
+		return TopicBasket, true
+	case "menu":
+		return TopicBasket, true
+	default:
+		return "", false
+	}
+}
+
+func mainMenuKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Задачи"),
+			tgbotapi.NewKeyboardButton("Напоминания"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Покупки"),
+			tgbotapi.NewKeyboardButton("Корзина"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("menu"),
+		),
+	)
+	kb.ResizeKeyboard = true
+	kb.OneTimeKeyboard = false
+	kb.Selective = true
+	return kb
+}
+
+type App struct {
+	Bot        *tgbotapi.BotAPI
+	Store      *Store
+	Calendar   CalendarClient
+	TZ         *time.Location
+	TTL        time.Duration
+	StateMu    sync.Mutex
+	ChatStates map[int64]*ChatState
+}
+
+func (a *App) getState(chatID int64) *ChatState {
+	a.StateMu.Lock()
+	defer a.StateMu.Unlock()
+
+	st := a.ChatStates[chatID]
+	if st == nil {
+		st = &ChatState{Topic: TopicBasket, LastActivity: time.Now().In(a.TZ)}
+		a.ChatStates[chatID] = st
+	}
+	return st
+}
+
+func (a *App) touchState(chatID int64) *ChatState {
+	a.StateMu.Lock()
+	defer a.StateMu.Unlock()
+
+	now := time.Now().In(a.TZ)
+	st := a.ChatStates[chatID]
+	if st == nil {
+		st = &ChatState{Topic: TopicBasket, LastActivity: now}
+		a.ChatStates[chatID] = st
+		return st
+	}
+	// TTL: if inactive too long -> basket
+	if now.Sub(st.LastActivity) > a.TTL {
+		st.Topic = TopicBasket
+	}
+	st.LastActivity = now
+	return st
+}
+
+func (a *App) setTopic(chatID int64, topic string) {
+	a.StateMu.Lock()
+	defer a.StateMu.Unlock()
+
+	now := time.Now().In(a.TZ)
+	st := a.ChatStates[chatID]
+	if st == nil {
+		st = &ChatState{}
+		a.ChatStates[chatID] = st
+	}
+	st.Topic = topic
+	st.LastActivity = now
+}
+
+func (a *App) resetToMenu(chatID int64) {
+	a.StateMu.Lock()
+	defer a.StateMu.Unlock()
+
+	now := time.Now().In(a.TZ)
+	st := a.ChatStates[chatID]
+	if st == nil {
+		st = &ChatState{}
+		a.ChatStates[chatID] = st
+	}
+	st.Topic = TopicBasket
+	st.LastActivity = now
+}
+
+func (a *App) ensureChatID(chatID int64) {
+	// If CHAT_ID env is not set, we persist the first seen chat id into kv so the scheduler can send proactive messages.
+	if strings.TrimSpace(os.Getenv("CHAT_ID")) != "" {
+		return
+	}
+	_ = a.Store.SetKV("chat_id", strconv.FormatInt(chatID, 10))
+}
+
+func (a *App) send(chatID int64, text string, opts ...func(*tgbotapi.MessageConfig)) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = mainMenuKeyboard()
+	for _, o := range opts {
+		o(&msg)
+	}
+	_, _ = a.Bot.Send(msg)
+}
+
+func (a *App) run(ctx context.Context) error {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 30
+	updates := a.Bot.GetUpdatesChan(u)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case upd := <-updates:
+			if upd.Message != nil {
+				a.handleMessage(ctx, upd.Message)
+			}
+			if upd.CallbackQuery != nil {
+				a.handleCallback(ctx, upd.CallbackQuery)
+			}
+		}
+	}
+}
+
+func (a *App) handleMessage(ctx context.Context, m *tgbotapi.Message) {
+	chatID := m.Chat.ID
+	a.ensureChatID(chatID)
+
+	// Commands
+	if m.IsCommand() {
+		switch m.Command() {
+		case "start":
+			a.resetToMenu(chatID)
+			a.send(chatID, "Меню открыто. Режим по умолчанию: КОРЗИНА.")
+		case "menu":
+			a.resetToMenu(chatID)
+			a.send(chatID, "Меню открыто. Режим по умолчанию: КОРЗИНА.")
+		case "list":
+			st := a.getState(chatID)
+			items, err := a.Store.ListActive(chatID, st.Topic)
+			if err != nil {
+				a.send(chatID, "Ошибка чтения списка.")
+				return
+			}
+			if st.Topic == TopicReminders {
+				a.send(chatID, "НАПОМИНАНИЯ:")
+				a.sendRemindersOneByOne(chatID, items)
+				return
+			}
+			a.send(chatID, formatItems(st.Topic, items))
+		default:
+			a.send(chatID, "Неизвестная команда. Используй /start или /menu.")
+		}
+		return
+	}
+
+	// Only text messages supported in this version
+	if m.Text == "" {
+		a.send(chatID, "Понимаю только текстовые сообщения.")
+		return
+	}
+
+	// Menu/topic buttons
+	if topic, ok := isTopicButtonText(m.Text); ok {
+		btn := strings.ToLower(strings.TrimSpace(m.Text))
+
+		// "menu" forces basket
+		if btn == "menu" {
+			a.resetToMenu(chatID)
+			items, err := a.Store.ListActive(chatID, TopicBasket)
+			if err != nil {
+				a.send(chatID, "Меню открыто. Режим: КОРЗИНА. Ошибка чтения корзины.")
+				return
+			}
+			a.send(chatID, "Меню открыто. Режим: КОРЗИНА.")
+			// show current basket snapshot
+			a.send(chatID, formatItems(TopicBasket, items))
+			return
+		}
+
+		a.setTopic(chatID, topic)
+
+		// Immediately show current list for selected topic
+		items, err := a.Store.ListActive(chatID, topic)
+		if err != nil {
+			a.send(chatID, fmt.Sprintf("Режим: %s. Ошибка чтения списка.", topicLabel(topic)))
+			return
+		}
+
+		if topic == TopicReminders {
+			a.send(chatID, fmt.Sprintf("Режим: %s.", topicLabel(topic)))
+			a.sendRemindersOneByOne(chatID, items)
+			return
+		}
+
+		a.send(chatID, fmt.Sprintf("Режим: %s.", topicLabel(topic)))
+		a.send(chatID, formatItems(topic, items))
+		return
+	}
+
+	// Normal text -> add to current topic (with TTL check)
+	st := a.touchState(chatID)
+	text := strings.TrimSpace(m.Text)
+	if text == "" {
+		return
+	}
+	if _, err := a.Store.AddItem(chatID, st.Topic, text); err != nil {
+		a.send(chatID, "Ошибка записи в БД.")
+		return
+	}
+	a.send(chatID, fmt.Sprintf("ДОБАВИЛ СООБЩЕНИЕ В %s.", topicLabel(st.Topic)))
+}
+
+func (a *App) handleCallback(ctx context.Context, cq *tgbotapi.CallbackQuery) {
+	chatID := cq.Message.Chat.ID
+	a.ensureChatID(chatID)
+	data := strings.TrimSpace(cq.Data)
+
+	// callback format: done:<id>
+	if strings.HasPrefix(data, "done:") {
+		idStr := strings.TrimPrefix(data, "done:")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err == nil {
+			_ = a.Store.DeleteItem(chatID, id)
+		}
+		// Acknowledge callback
+		_, _ = a.Bot.Request(tgbotapi.NewCallback(cq.ID, "Удалено"))
+
+		// Edit the original message to show completion and remove buttons
+		edit := tgbotapi.NewEditMessageText(chatID, cq.Message.MessageID, "✅ Удалено")
+		_, _ = a.Bot.Send(edit)
+		editMarkup := tgbotapi.NewEditMessageReplyMarkup(chatID, cq.Message.MessageID, tgbotapi.InlineKeyboardMarkup{})
+		_, _ = a.Bot.Send(editMarkup)
+		return
+	}
+
+	_, _ = a.Bot.Request(tgbotapi.NewCallback(cq.ID, ""))
+}
+
+func (a *App) sendRemindersOneByOne(chatID int64, items []Item) {
+	if len(items) == 0 {
+		a.send(chatID, "Пусто.")
+		return
+	}
+	for _, it := range items {
+		msg := tgbotapi.NewMessage(chatID, formatSingleReminder(it))
+		msg.ReplyMarkup = singleReminderKeyboard(it.ID)
+		_, _ = a.Bot.Send(msg)
+	}
+}
+
+func singleReminderKeyboard(id int64) tgbotapi.InlineKeyboardMarkup {
+	btn := tgbotapi.NewInlineKeyboardButtonData("✅", fmt.Sprintf("done:%d", id))
+	return tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btn))
+}
+
+func formatSingleReminder(it Item) string {
+	return fmt.Sprintf("НАПОМИНАНИЕ #%d: %s", it.ID, it.Text)
+}
+
+func formatItems(topic string, items []Item) string {
+	if len(items) == 0 {
+		return fmt.Sprintf("%s: пусто.", topicLabel(topic))
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%s:\n", topicLabel(topic)))
+	for i, it := range items {
+		b.WriteString(fmt.Sprintf("%d) %s\n", i+1, it.Text))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func formatReminders(items []Item) string {
+	if len(items) == 0 {
+		return "НАПОМИНАНИЯ: пусто."
+	}
+	var b strings.Builder
+	b.WriteString("НАПОМИНАНИЯ:\n")
+	for i, it := range items {
+		b.WriteString(fmt.Sprintf("%d) %s\n", i+1, it.Text))
+	}
+	b.WriteString("\n(Нажми ✅ чтобы удалить пункт)")
+	return strings.TrimSpace(b.String())
+}
+
+func initApp() (*App, error) {
+	// Timezone
+	tzName := envOr("TZ", "Europe/Moscow")
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		return nil, fmt.Errorf("bad TZ %q: %w", tzName, err)
+	}
+
+	// Store
+	dbPath := envOr("DB_PATH", "gtd.db")
+	store, err := openStore(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Telegram bot
+	token := mustEnv("BOT_TOKEN")
+	bot, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		return nil, err
+	}
+	bot.Debug = strings.EqualFold(envOr("BOT_DEBUG", "false"), "true")
+
+	ttlMin, _ := strconv.Atoi(envOr("TTL_MINUTES", "10"))
+	ttl := time.Duration(ttlMin) * time.Minute
+
+	// Calendar client (stub unless configured)
+	cal, _ := NewGoogleCalendarClientFromEnv(loc)
+
+	return &App{
+		Bot:        bot,
+		Store:      store,
+		Calendar:   cal,
+		TZ:         loc,
+		TTL:        ttl,
+		ChatStates: map[int64]*ChatState{},
+	}, nil
+}
+
+func main() {
+	godotenv.Load()
+	app, err := initApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer app.Store.DB.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Scheduler
+	s := NewScheduler(app.Bot, app.Store, app.Calendar, app.TZ)
+	s.Start(ctx)
+
+	log.Printf("bot started as @%s", app.Bot.Self.UserName)
+	if err := app.run(ctx); err != nil && err != context.Canceled {
+		log.Fatal(err)
 	}
 }
