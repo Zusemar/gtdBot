@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +24,6 @@ type Scheduler struct {
 }
 
 func NewScheduler(bot *tgbotapi.BotAPI, store *Store, cal CalendarClient, tz *time.Location) *Scheduler {
-	// Fixed times per your request (Moscow time): 08:00 10:00 14:00 19:00 23:00
 	return &Scheduler{
 		bot:           bot,
 		store:         store,
@@ -40,10 +40,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 func (s *Scheduler) loop(ctx context.Context) {
-	// Track last fired date+time to avoid duplicates if loop checks multiple times in the same minute.
-	lastFired := map[string]string{} // key=kind:time -> date(YYYY-MM-DD)
+	lastFired := map[string]string{} // key=kind:time -> date
 
-	ticker := time.NewTicker(15 * time.Second) // small tick; we still match by minute
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -55,13 +54,13 @@ func (s *Scheduler) loop(ctx context.Context) {
 			hhmm := now.Format("15:04")
 			today := now.Format("2006-01-02")
 
-			// Morning digest (calendar)
+			// Morning digest
 			if hhmm == s.morningTime && lastFired["morning:"+hhmm] != today {
 				lastFired["morning:"+hhmm] = today
 				s.sendMorningDigest(ctx, now)
 			}
 
-			// Reminders digest at fixed times
+			// Reminders
 			for _, t := range s.reminderTimes {
 				if hhmm == t && lastFired["reminders:"+t] != today {
 					lastFired["reminders:"+t] = today
@@ -79,36 +78,15 @@ func (s *Scheduler) loop(ctx context.Context) {
 }
 
 func (s *Scheduler) targetChatID() (int64, bool) {
-	// Priority: env CHAT_ID; otherwise read persisted kv chat_id.
-	if chatID, ok := parseInt64(strings.TrimSpace(os.Getenv("CHAT_ID"))); ok {
-		return chatID, true
-	}
-	if v, ok := s.store.GetKV("chat_id"); ok {
-		return parseInt64(strings.TrimSpace(v))
-	}
-	return 0, false
-}
-
-func parseInt64(s string) (int64, bool) {
-	if s == "" {
+	raw := strings.TrimSpace(os.Getenv("CHAT_ID"))
+	if raw == "" {
 		return 0, false
 	}
-	var neg bool
-	if strings.HasPrefix(s, "-") {
-		neg = true
-		s = strings.TrimPrefix(s, "-")
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
 	}
-	var n int64
-	for _, ch := range s {
-		if ch < '0' || ch > '9' {
-			return 0, false
-		}
-		n = n*10 + int64(ch-'0')
-	}
-	if neg {
-		n = -n
-	}
-	return n, true
+	return id, true
 }
 
 func (s *Scheduler) sendMorningDigest(ctx context.Context, now time.Time) {
@@ -117,10 +95,12 @@ func (s *Scheduler) sendMorningDigest(ctx context.Context, now time.Time) {
 		log.Printf("scheduler: CHAT_ID not set; skipping morning digest")
 		return
 	}
+
 	text, err := s.calendar.GetTodaySchedule(ctx, now)
 	if err != nil {
 		text = fmt.Sprintf("Ошибка чтения календаря: %v", err)
 	}
+
 	msg := tgbotapi.NewMessage(chatID, "РАСПИСАНИЕ НА СЕГОДНЯ:\n"+text)
 	_, _ = s.bot.Send(msg)
 }
@@ -128,9 +108,10 @@ func (s *Scheduler) sendMorningDigest(ctx context.Context, now time.Time) {
 func (s *Scheduler) sendReminders(now time.Time) {
 	chatID, ok := s.targetChatID()
 	if !ok {
-		log.Printf("scheduler: CHAT_ID not set and kv.chat_id missing; skipping reminders")
+		log.Printf("scheduler: CHAT_ID not set; skipping reminders")
 		return
 	}
+
 	items, err := s.store.ListActive(chatID, TopicReminders)
 	if err != nil {
 		log.Printf("scheduler: list reminders error: %v", err)
@@ -139,9 +120,11 @@ func (s *Scheduler) sendReminders(now time.Time) {
 	if len(items) == 0 {
 		return
 	}
+
+	// One message per reminder with ✅ delete button
 	for _, it := range items {
-		msg := tgbotapi.NewMessage(chatID, formatSingleReminder(it))
-		msg.ReplyMarkup = singleReminderKeyboard(it.ID)
+		msg := tgbotapi.NewMessage(chatID, formatSingleItem(TopicReminders, it))
+		msg.ReplyMarkup = singleKeyboard(it.ID)
 		_, _ = s.bot.Send(msg)
 	}
 }
@@ -152,10 +135,13 @@ func (s *Scheduler) wipeReminders(now time.Time) {
 		log.Printf("scheduler: CHAT_ID not set; skipping wipe")
 		return
 	}
-	if err := s.store.DeleteAllReminders(chatID); err != nil {
+
+	_, err := s.store.DB.Exec(`DELETE FROM items WHERE chat_id=? AND topic=?`, chatID, TopicReminders)
+	if err != nil {
 		log.Printf("scheduler: wipe reminders error: %v", err)
 		return
 	}
+
 	msg := tgbotapi.NewMessage(chatID, "НАПОМИНАНИЯ ОЧИЩЕНЫ (ночной вайп).")
 	_, _ = s.bot.Send(msg)
 }

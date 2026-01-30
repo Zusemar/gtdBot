@@ -94,20 +94,6 @@ CREATE TABLE IF NOT EXISTS kv (
 	return err
 }
 
-func (s *Store) SetKV(key, value string) error {
-	_, err := s.DB.Exec(`INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, key, value)
-	return err
-}
-
-func (s *Store) GetKV(key string) (string, bool) {
-	var v string
-	err := s.DB.QueryRow(`SELECT v FROM kv WHERE k=?`, key).Scan(&v)
-	if err != nil {
-		return "", false
-	}
-	return v, true
-}
-
 func (s *Store) AddItem(chatID int64, topic, text string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.DB.Exec(
@@ -150,11 +136,6 @@ func (s *Store) ListActive(chatID int64, topic string) ([]Item, error) {
 
 func (s *Store) DeleteItem(chatID, id int64) error {
 	_, err := s.DB.Exec(`DELETE FROM items WHERE chat_id=? AND id=?`, chatID, id)
-	return err
-}
-
-func (s *Store) DeleteAllReminders(chatID int64) error {
-	_, err := s.DB.Exec(`DELETE FROM items WHERE chat_id=? AND topic=?`, chatID, TopicReminders)
 	return err
 }
 
@@ -205,15 +186,12 @@ func mainMenuKeyboard() tgbotapi.ReplyKeyboardMarkup {
 		),
 	)
 	kb.ResizeKeyboard = true
-	kb.OneTimeKeyboard = false
-	kb.Selective = true
 	return kb
 }
 
 type App struct {
 	Bot        *tgbotapi.BotAPI
 	Store      *Store
-	Calendar   CalendarClient
 	TZ         *time.Location
 	TTL        time.Duration
 	StateMu    sync.Mutex
@@ -243,7 +221,6 @@ func (a *App) touchState(chatID int64) *ChatState {
 		a.ChatStates[chatID] = st
 		return st
 	}
-	// TTL: if inactive too long -> basket
 	if now.Sub(st.LastActivity) > a.TTL {
 		st.Topic = TopicBasket
 	}
@@ -266,33 +243,12 @@ func (a *App) setTopic(chatID int64, topic string) {
 }
 
 func (a *App) resetToMenu(chatID int64) {
-	a.StateMu.Lock()
-	defer a.StateMu.Unlock()
-
-	now := time.Now().In(a.TZ)
-	st := a.ChatStates[chatID]
-	if st == nil {
-		st = &ChatState{}
-		a.ChatStates[chatID] = st
-	}
-	st.Topic = TopicBasket
-	st.LastActivity = now
+	a.setTopic(chatID, TopicBasket)
 }
 
-func (a *App) ensureChatID(chatID int64) {
-	// If CHAT_ID env is not set, we persist the first seen chat id into kv so the scheduler can send proactive messages.
-	if strings.TrimSpace(os.Getenv("CHAT_ID")) != "" {
-		return
-	}
-	_ = a.Store.SetKV("chat_id", strconv.FormatInt(chatID, 10))
-}
-
-func (a *App) send(chatID int64, text string, opts ...func(*tgbotapi.MessageConfig)) {
+func (a *App) send(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = mainMenuKeyboard()
-	for _, o := range opts {
-		o(&msg)
-	}
 	_, _ = a.Bot.Send(msg)
 }
 
@@ -318,77 +274,34 @@ func (a *App) run(ctx context.Context) error {
 
 func (a *App) handleMessage(ctx context.Context, m *tgbotapi.Message) {
 	chatID := m.Chat.ID
-	a.ensureChatID(chatID)
 
-	// Commands
 	if m.IsCommand() {
-		switch m.Command() {
-		case "start":
+		if m.Command() == "start" || m.Command() == "menu" {
 			a.resetToMenu(chatID)
 			a.send(chatID, "Меню открыто. Режим по умолчанию: КОРЗИНА.")
-		case "menu":
-			a.resetToMenu(chatID)
-			a.send(chatID, "Меню открыто. Режим по умолчанию: КОРЗИНА.")
-		case "list":
-			st := a.getState(chatID)
-			items, err := a.Store.ListActive(chatID, st.Topic)
-			if err != nil {
-				a.send(chatID, "Ошибка чтения списка.")
-				return
-			}
-			if st.Topic == TopicReminders {
-				a.send(chatID, "НАПОМИНАНИЯ:")
-				a.sendRemindersOneByOne(chatID, items)
-				return
-			}
-			a.send(chatID, formatItems(st.Topic, items))
-		default:
-			a.send(chatID, "Неизвестная команда. Используй /start или /menu.")
 		}
 		return
 	}
 
-	// Only text messages supported in this version
 	if m.Text == "" {
-		a.send(chatID, "Понимаю только текстовые сообщения.")
+		a.send(chatID, "Понимаю только текст.")
 		return
 	}
 
-	// Menu/topic buttons
 	if topic, ok := isTopicButtonText(m.Text); ok {
-		btn := strings.ToLower(strings.TrimSpace(m.Text))
-
-		// "menu" forces basket
-		if btn == "menu" {
+		if strings.ToLower(m.Text) == "menu" {
 			a.resetToMenu(chatID)
-			items, err := a.Store.ListActive(chatID, TopicBasket)
-			if err != nil {
-				a.send(chatID, "Меню открыто. Режим: КОРЗИНА. Ошибка чтения корзины.")
-				return
-			}
+			items, _ := a.Store.ListActive(chatID, TopicBasket)
 			a.send(chatID, "Меню открыто. Режим: КОРЗИНА.")
-			// show current basket snapshot
-			a.send(chatID, formatItems(TopicBasket, items))
+			a.sendItemsOneByOne(chatID, TopicBasket, items)
 			return
 		}
 
 		a.setTopic(chatID, topic)
-
-		// Immediately show current list for selected topic
-		items, err := a.Store.ListActive(chatID, topic)
-		if err != nil {
-			a.send(chatID, fmt.Sprintf("Режим: %s. Ошибка чтения списка.", topicLabel(topic)))
-			return
-		}
-
-		if topic == TopicReminders {
-			a.send(chatID, fmt.Sprintf("Режим: %s.", topicLabel(topic)))
-			a.sendRemindersOneByOne(chatID, items)
-			return
-		}
+		items, _ := a.Store.ListActive(chatID, topic)
 
 		a.send(chatID, fmt.Sprintf("Режим: %s.", topicLabel(topic)))
-		a.send(chatID, formatItems(topic, items))
+		a.sendItemsOneByOne(chatID, topic, items)
 		return
 	}
 
@@ -398,8 +311,10 @@ func (a *App) handleMessage(ctx context.Context, m *tgbotapi.Message) {
 	if text == "" {
 		return
 	}
-	if _, err := a.Store.AddItem(chatID, st.Topic, text); err != nil {
-		a.send(chatID, "Ошибка записи в БД.")
+
+	_, err := a.Store.AddItem(chatID, st.Topic, text)
+	if err != nil {
+		a.send(chatID, "Ошибка записи.")
 		return
 	}
 	a.send(chatID, fmt.Sprintf("ДОБАВИЛ СООБЩЕНИЕ В %s.", topicLabel(st.Topic)))
@@ -407,109 +322,78 @@ func (a *App) handleMessage(ctx context.Context, m *tgbotapi.Message) {
 
 func (a *App) handleCallback(ctx context.Context, cq *tgbotapi.CallbackQuery) {
 	chatID := cq.Message.Chat.ID
-	a.ensureChatID(chatID)
 	data := strings.TrimSpace(cq.Data)
 
-	// callback format: done:<id>
 	if strings.HasPrefix(data, "done:") {
 		idStr := strings.TrimPrefix(data, "done:")
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err == nil {
-			_ = a.Store.DeleteItem(chatID, id)
-		}
-		// Acknowledge callback
-		_, _ = a.Bot.Request(tgbotapi.NewCallback(cq.ID, "Удалено"))
+		id, _ := strconv.ParseInt(idStr, 10, 64)
+		_ = a.Store.DeleteItem(chatID, id)
 
-		// Edit the original message to show completion and remove buttons
+		_, _ = a.Bot.Request(tgbotapi.NewCallback(cq.ID, "Удалено"))
 		edit := tgbotapi.NewEditMessageText(chatID, cq.Message.MessageID, "✅ Удалено")
 		_, _ = a.Bot.Send(edit)
 		editMarkup := tgbotapi.NewEditMessageReplyMarkup(chatID, cq.Message.MessageID, tgbotapi.InlineKeyboardMarkup{})
 		_, _ = a.Bot.Send(editMarkup)
-		return
 	}
-
-	_, _ = a.Bot.Request(tgbotapi.NewCallback(cq.ID, ""))
 }
 
-func (a *App) sendRemindersOneByOne(chatID int64, items []Item) {
+func (a *App) sendItemsOneByOne(chatID int64, topic string, items []Item) {
 	if len(items) == 0 {
 		a.send(chatID, "Пусто.")
 		return
 	}
 	for _, it := range items {
-		msg := tgbotapi.NewMessage(chatID, formatSingleReminder(it))
-		msg.ReplyMarkup = singleReminderKeyboard(it.ID)
+		msg := tgbotapi.NewMessage(chatID, formatSingleItem(topic, it))
+		msg.ReplyMarkup = singleKeyboard(it.ID)
 		_, _ = a.Bot.Send(msg)
 	}
 }
 
-func singleReminderKeyboard(id int64) tgbotapi.InlineKeyboardMarkup {
+func singleKeyboard(id int64) tgbotapi.InlineKeyboardMarkup {
 	btn := tgbotapi.NewInlineKeyboardButtonData("✅", fmt.Sprintf("done:%d", id))
 	return tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btn))
 }
 
-func formatSingleReminder(it Item) string {
-	return fmt.Sprintf("НАПОМИНАНИЕ #%d: %s", it.ID, it.Text)
-}
-
-func formatItems(topic string, items []Item) string {
-	if len(items) == 0 {
-		return fmt.Sprintf("%s: пусто.", topicLabel(topic))
+func formatSingleItem(topic string, it Item) string {
+	switch topic {
+	case TopicTasks:
+		return fmt.Sprintf("ЗАДАЧА #%d: %s", it.ID, it.Text)
+	case TopicReminders:
+		return fmt.Sprintf("НАПОМИНАНИЕ #%d: %s", it.ID, it.Text)
+	case TopicShopping:
+		return fmt.Sprintf("ПОКУПКА #%d: %s", it.ID, it.Text)
+	case TopicBasket:
+		return fmt.Sprintf("КОРЗИНА #%d: %s", it.ID, it.Text)
+	default:
+		return fmt.Sprintf("%s #%d: %s", strings.ToUpper(topic), it.ID, it.Text)
 	}
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%s:\n", topicLabel(topic)))
-	for i, it := range items {
-		b.WriteString(fmt.Sprintf("%d) %s\n", i+1, it.Text))
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func formatReminders(items []Item) string {
-	if len(items) == 0 {
-		return "НАПОМИНАНИЯ: пусто."
-	}
-	var b strings.Builder
-	b.WriteString("НАПОМИНАНИЯ:\n")
-	for i, it := range items {
-		b.WriteString(fmt.Sprintf("%d) %s\n", i+1, it.Text))
-	}
-	b.WriteString("\n(Нажми ✅ чтобы удалить пункт)")
-	return strings.TrimSpace(b.String())
 }
 
 func initApp() (*App, error) {
-	// Timezone
 	tzName := envOr("TZ", "Europe/Moscow")
 	loc, err := time.LoadLocation(tzName)
 	if err != nil {
-		return nil, fmt.Errorf("bad TZ %q: %w", tzName, err)
+		return nil, err
 	}
 
-	// Store
 	dbPath := envOr("DB_PATH", "gtd.db")
 	store, err := openStore(dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Telegram bot
 	token := mustEnv("BOT_TOKEN")
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
 	}
-	bot.Debug = strings.EqualFold(envOr("BOT_DEBUG", "false"), "true")
 
 	ttlMin, _ := strconv.Atoi(envOr("TTL_MINUTES", "10"))
 	ttl := time.Duration(ttlMin) * time.Minute
 
-	// Calendar client (stub unless configured)
-	cal, _ := NewGoogleCalendarClientFromEnv(loc)
-
 	return &App{
 		Bot:        bot,
 		Store:      store,
-		Calendar:   cal,
 		TZ:         loc,
 		TTL:        ttl,
 		ChatStates: map[int64]*ChatState{},
@@ -524,15 +408,10 @@ func main() {
 	}
 	defer app.Store.DB.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Scheduler
-	s := NewScheduler(app.Bot, app.Store, app.Calendar, app.TZ)
-	s.Start(ctx)
+	ctx := context.Background()
 
 	log.Printf("bot started as @%s", app.Bot.Self.UserName)
-	if err := app.run(ctx); err != nil && err != context.Canceled {
+	if err := app.run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
