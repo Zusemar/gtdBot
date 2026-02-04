@@ -1,0 +1,15 @@
+services:
+  gtdbot:
+    build: .
+    container_name: gtdbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Moscow
+      DB_PATH: /data/gtd.db
+    volumes:
+      - gtdbot_data:/data
+volumes:
+  gtdbot_data:
+
